@@ -1,0 +1,9 @@
+{
+  "additionalFiles": "..\\..\\..",
+  "compiler.optimization_flags": "-Os",
+  "customBuildProperties": "build.warn_data_percentage=75",
+  "fqbn": "esp32:esp32:heltec_wifi_kit_32_V3",
+  "hardwareFolders": "C:\\Users\\42160\\AppData\\Local\\Arduino15\\packages",
+  "otherLibrariesFolders": "D:\\software\\Arduino IDE\\Documents\\esp32\\libraries,C:\\Users\\42160\\Documents\\Arduino\\libraries",
+  "sketchLocation": "E:\\work\\programs\\Drain Blockage\\MDC04_rings"
+}

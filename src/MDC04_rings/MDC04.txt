@@ -1,0 +1,559 @@
+/*
+  MDC04 v31 - CH1 Monitor + OFAT 参数扫描测试模式
+  - 正常模式：CH1 每秒轮询（铜片干/湿）
+  - 测试模式（串口 '6' 启动）：单因素轮换扫描 Cr / 重复性 / Co
+    每个参数在 EMPTY 和 FULL 两段各扫多个值，每值采 50 笔
+    用进/出水泵 + 水位传感器自动判断满/空（仿 V2）
+
+  引脚：
+    DQ      GPIO2  (单总线)
+    进水泵   GPIO4  (HIGH=开, 水槽->水管)
+    出水泵   GPIO5  (HIGH=开, 水管->水槽)
+    高水位   GPIO6  (LOW=有水)
+    低水位   GPIO7  (LOW=有水)
+*/
+
+#define DQ_PIN          2
+#define PUMP_INTAKE_PIN 4
+#define PUMP_DRAIN_PIN  5
+#define WATER_HIGH_PIN  6
+#define WATER_LOW_PIN   7
+
+// --- 默认参数 ------------------------------------------------
+#define COS_CH1_DEFAULT 0x09   // → CH1 (b6=0x78)
+#define CFB_DEFAULT      0x23
+#define REP_DEFAULT      0x01   // 重复性候选(MED)，字节待实测
+
+// --- 扫描候选值 ----------------------------------------------
+uint8_t crVals[]  = {0x10, 0x18, 0x23, 0x30, 0x40};   // Cr (Cfb) 5值
+uint8_t repVals[] = {0x00, 0x01, 0x02};                // 重复性 (Config) 3值
+uint8_t coVals[]  = {0x00, 0x01, 0x02, 0x04, 0x09};   // Co (Cos) 5值，会动通道
+const int CR_N  = 5;
+const int REP_N = 3;
+const int CO_N  = 5;
+const char* paramNames[] = {"Cr", "Rep", "Co"};
+
+// --- 采样/超时 ------------------------------------------------
+const int      SAMPLES_PER_BATCH = 50;
+const uint32_t FILL_TIMEOUT_MS   = 60000;
+const uint32_t DRAIN_TIMEOUT_MS  = 90000;
+const uint32_t SAMPLE_GAP_MS     = 100;  // 每笔间隔
+
+// --- 正常范围 -------------------------------------------------
+const uint16_t RAW_MIN_VALID = 600;
+
+// --- 单总线时序 ----------------------------------------------
+inline void gpio_low()  { digitalWrite(DQ_PIN, LOW); }
+inline void gpio_high() { digitalWrite(DQ_PIN, HIGH); }
+inline int  gpio_read() { return digitalRead(DQ_PIN); }
+
+void gpio_init() {
+  pinMode(DQ_PIN, OUTPUT_OPEN_DRAIN);
+  gpio_high();
+}
+
+bool ow_reset() {
+  cli();
+  gpio_low(); delayMicroseconds(500);
+  gpio_high();
+  int found = -1;
+  for (int t = 0; t < 300; t++) {
+    if (gpio_read() == 0) { found = t; break; }
+    delayMicroseconds(1);
+  }
+  sei();
+  delayMicroseconds(found < 0 ? 0 : 410 - found);
+  return found >= 0;
+}
+
+void ow_write_byte(uint8_t byte) {
+  cli();
+  for (uint8_t i = 0; i < 8; i++) {
+    gpio_low();
+    if (byte & 0x01) { delayMicroseconds(6);  gpio_high(); delayMicroseconds(64); }
+    else              { delayMicroseconds(65); gpio_high(); delayMicroseconds(5);  }
+    byte >>= 1;
+  }
+  sei();
+}
+
+uint8_t ow_read_byte() {
+  uint8_t byte = 0;
+  cli();
+  for (uint8_t i = 0; i < 8; i++) {
+    gpio_low(); gpio_high();
+    delayMicroseconds(13);
+    if (gpio_read()) byte |= 0x80;
+    delayMicroseconds(50);
+    byte >>= 1;
+  }
+  sei();
+  return byte;
+}
+
+bool ow_poll_done() {
+  uint32_t deadline = millis() + 500;
+  while (millis() < deadline) {
+    cli();
+    gpio_low(); delayMicroseconds(1); gpio_high(); delayMicroseconds(9);
+    uint8_t bit = gpio_read();
+    sei();
+    if (bit == 0) return true;
+    delayMicroseconds(10);
+  }
+  return false;
+}
+
+// --- 写参数（Cos/Cfb/Config 各一次 WriteScratchpad）----------
+void write_scratch_byte(uint8_t addr, uint8_t val) {
+  if (!ow_reset()) return;
+  ow_write_byte(0xCC);
+  ow_write_byte(0x4E);
+  ow_write_byte(addr);
+  ow_write_byte(val);
+  delayMicroseconds(25);
+  gpio_high();
+  delayMicroseconds(10);
+}
+
+void apply_params(uint8_t cos, uint8_t cfb, uint8_t config) {
+  write_scratch_byte(0x1D, cos);
+  delay(2);
+  write_scratch_byte(0x22, cfb);
+  delay(2);
+  write_scratch_byte(0x06, config);
+}
+
+// --- 触发转换 + 读 Scratchpad（带转换时间计时）----------------
+uint32_t g_convMs = 0;
+bool convert_and_read(uint16_t& c_raw, uint8_t& b6) {
+  if (!ow_reset()) return false;
+  ow_write_byte(0xCC);
+  ow_write_byte(0x66);          // ConvertC
+  uint32_t t0 = millis();
+  if (!ow_poll_done()) return false;
+  g_convMs = millis() - t0;
+  if (!ow_reset()) return false;
+  ow_write_byte(0xCC);
+  ow_write_byte(0xBE);          // ReadScratchpad
+  uint8_t d[9];
+  for (int i = 0; i < 9; i++) d[i] = ow_read_byte();
+  gpio_low(); delayMicroseconds(2); gpio_high(); delayMicroseconds(500);
+  c_raw = ((uint16_t)d[3] << 8) | d[2];
+  b6 = d[6];
+  if (c_raw < RAW_MIN_VALID) return false;
+  return true;
+}
+
+bool measure_with_params(uint8_t cos, uint8_t cfb, uint8_t config,
+                         uint16_t& c_raw, uint8_t& b6, double& c_pf) {
+  apply_params(cos, cfb, config);
+  delay(3);
+  for (int retry = 0; retry < 3; retry++) {
+    if (convert_and_read(c_raw, b6)) {
+      c_pf = 15.5 + c_raw / 32768.0 * 31.0;
+      return true;
+    }
+    delay(20);
+  }
+  return false;
+}
+
+// --- 泵 / 水位 ------------------------------------------------
+void pumpIntakeOn()  { digitalWrite(PUMP_INTAKE_PIN, HIGH); }
+void pumpIntakeOff() { digitalWrite(PUMP_INTAKE_PIN, LOW); }
+void pumpDrainOn()   { digitalWrite(PUMP_DRAIN_PIN,  HIGH); }
+void pumpDrainOff()  { digitalWrite(PUMP_DRAIN_PIN,  LOW); }
+void pumpAllOff()    { pumpIntakeOff(); pumpDrainOff(); }
+
+const unsigned long WATER_DEBOUNCE_MS = 10;
+const uint8_t WATER_TRIGGER_COUNT = 5;
+unsigned long lastWaterCheckMs = 0;
+uint8_t io6_low_count = 0;   // IO6==LOW(有水) 计数
+uint8_t io7_high_count = 0;  // IO7==HIGH(无水) 计数
+
+void waterDebounce() {
+  if (millis() - lastWaterCheckMs < WATER_DEBOUNCE_MS) return;
+  lastWaterCheckMs = millis();
+
+  if (digitalRead(WATER_HIGH_PIN) == LOW) {
+    if (io6_low_count < WATER_TRIGGER_COUNT) io6_low_count++;
+  } else {
+    if (io6_low_count > 0) io6_low_count--;
+  }
+  if (digitalRead(WATER_LOW_PIN) == HIGH) {
+    if (io7_high_count < WATER_TRIGGER_COUNT) io7_high_count++;
+  } else {
+    if (io7_high_count > 0) io7_high_count--;
+  }
+
+  // --- 自动保护：IO6 有水时强制停进水泵（手动/测试模式通用）---
+  if (io6_low_count >= WATER_TRIGGER_COUNT && digitalRead(PUMP_INTAKE_PIN) == HIGH) {
+    pumpIntakeOff();
+    Serial.println(F("#!IO6_LOW,INTAKE_PUMP_STOP  [高水位有水，自动停进水泵]"));
+  }
+  // --- 自动保护：IO7 无水时强制停出水泵（手动/测试模式通用）---
+  if (io7_high_count >= WATER_TRIGGER_COUNT && digitalRead(PUMP_DRAIN_PIN) == HIGH) {
+    pumpDrainOff();
+    Serial.println(F("#!IO7_HIGH,DRAIN_PUMP_STOP  [低水位无水，自动停出水泵]"));
+  }
+}
+bool waterEmptyStable() { return (io6_low_count == 0 && io7_high_count >= WATER_TRIGGER_COUNT); }
+
+// IO6 高水位持续无水（WATER_TRIGGER_COUNT 次），
+// 用于排水阶段：当低水位从未被触发过时，仅靠 IO6 也足以判定管已空。
+bool waterEmptyByHighSensor() { return (io6_low_count == 0); }
+
+// 满管：水淹没到高水位传感器，IO6+IO7 都为 LOW（LOW=有水）
+bool waterFullStable()  { return (io6_low_count >= WATER_TRIGGER_COUNT && io7_high_count == 0); }
+
+// --- 测试模式状态机 ------------------------------------------
+enum TestState {
+  TEST_IDLE = 0, TEST_ENSURE_EMPTY,
+  TEST_STABILIZE,   // 停泵后等 2s 稳定再采集
+  TEST_COLLECT,
+  TEST_FILL,
+  TEST_DRAIN_RESTORE, TEST_DONE
+};
+
+struct BatchResult {
+  uint8_t stage;     // 0=EMPTY,1=FULL
+  uint8_t param;     // 0=Cr,1=Rep,2=Co
+  uint8_t valIdx;
+  double  mean;
+  double  stddev;
+  uint8_t b6;
+};
+
+bool    testActive = false;
+uint8_t testState  = TEST_IDLE;
+uint8_t testStage  = 0;
+uint8_t testParam  = 0;
+uint8_t testValIdx = 0;
+uint8_t testSampleIdx = 0;
+uint32_t testPhaseStartMs = 0;
+uint32_t testStabilizeStartMs = 0;   // 停泵稳定开始时刻
+double  testSum = 0, testSumSq = 0;
+uint8_t testCurCos = COS_CH1_DEFAULT, testCurCfb = CFB_DEFAULT, testCurConfig = REP_DEFAULT;
+uint8_t testCurB6 = 0;
+BatchResult results[26];
+int resultCount = 0;
+int positionId = 1;
+
+uint8_t getParamVal(uint8_t param, uint8_t valIdx) {
+  if (param == 0) return crVals[valIdx];
+  if (param == 1) return repVals[valIdx];
+  return coVals[valIdx];
+}
+void getParamValues(uint8_t param, uint8_t& cos, uint8_t& cfb, uint8_t& config, uint8_t valIdx) {
+  cos = COS_CH1_DEFAULT; cfb = CFB_DEFAULT; config = REP_DEFAULT;
+  if (param == 0)      cfb   = crVals[valIdx];
+  else if (param == 1) config = repVals[valIdx];
+  else                 cos   = coVals[valIdx];
+}
+int findResult(uint8_t stage, uint8_t param, uint8_t valIdx) {
+  for (int i = 0; i < resultCount; i++)
+    if (results[i].stage == stage && results[i].param == param && results[i].valIdx == valIdx)
+      return i;
+  return -1;
+}
+
+void testStart() {
+  testActive = true;
+  resultCount = 0;
+  testState = TEST_ENSURE_EMPTY;
+  testPhaseStartMs = millis();
+  pumpAllOff();
+  Serial.println(F("#TEST_START  OFAT: Cr/Rep/Co x EMPTY/FULL, 50 samples/val"));
+  Serial.println(F("#CMD 0=stop  A/B/C/D/E=pump 5n=pos"));
+}
+void testStop() {
+  testActive = false;
+  pumpAllOff();
+  apply_params(COS_CH1_DEFAULT, CFB_DEFAULT, REP_DEFAULT);
+  Serial.println(F("#TEST_STOPPED"));
+}
+
+void testCollectSample() {
+  if (testSampleIdx == 0) {
+    getParamValues(testParam, testCurCos, testCurCfb, testCurConfig, testValIdx);
+    testSum = 0; testSumSq = 0;
+  }
+  uint16_t c_raw; uint8_t b6; double c_pf;
+  bool ok = measure_with_params(testCurCos, testCurCfb, testCurConfig, c_raw, b6, c_pf);
+  if (ok) {
+    testSum += c_pf; testSumSq += c_pf * c_pf;
+    testCurB6 = b6;
+  } else {
+    c_pf = 0;
+  }
+  Serial.print(positionId);            Serial.print(',');
+  Serial.print(testStage == 0 ? F("EMPTY") : F("FULL")); Serial.print(',');
+  Serial.print(paramNames[testParam]); Serial.print(',');
+  Serial.print(F("0x")); Serial.print(getParamVal(testParam, testValIdx), HEX); Serial.print(',');
+  Serial.print(c_raw);                 Serial.print(',');
+  Serial.print(c_pf, 4);              Serial.print(F("pF,"));
+  Serial.print(F("b6=0x")); Serial.print(b6, HEX); Serial.print(',');
+  Serial.print(g_convMs);             Serial.println(F("ms,#S"));
+  testSampleIdx++;
+  if (testSampleIdx >= SAMPLES_PER_BATCH) testFinishBatch();
+}
+
+void testFinishBatch() {
+  double mean = testSum / SAMPLES_PER_BATCH;
+  double stddev = sqrt(testSumSq / SAMPLES_PER_BATCH - mean * mean);
+  results[resultCount].stage  = testStage;
+  results[resultCount].param  = testParam;
+  results[resultCount].valIdx = testValIdx;
+  results[resultCount].mean   = mean;
+  results[resultCount].stddev = stddev;
+  results[resultCount].b6     = testCurB6;
+  resultCount++;
+  Serial.print(F("SUMMARY,"));
+  Serial.print(testStage == 0 ? F("EMPTY") : F("FULL")); Serial.print(',');
+  Serial.print(paramNames[testParam]); Serial.print(F(",0x"));
+  Serial.print(getParamVal(testParam, testValIdx), HEX); Serial.print(',');
+  Serial.print(mean, 4); Serial.print(F("pF,std=")); Serial.print(stddev, 4);
+  Serial.print(F(",b6=0x")); Serial.println(testCurB6, HEX);
+  // advance
+  testValIdx++;
+  int n = (testParam == 0) ? CR_N : (testParam == 1) ? REP_N : CO_N;
+  if (testValIdx < n) {
+    testSampleIdx = 0;
+  } else {
+    testParam++; testValIdx = 0; testSampleIdx = 0;
+    if (testParam > 2) {
+      if (testStage == 0) {
+        testState = TEST_FILL; testPhaseStartMs = millis(); pumpIntakeOn();
+        Serial.println(F("#TEST,FILL_START"));
+      } else {
+        testState = TEST_DRAIN_RESTORE; testPhaseStartMs = millis(); pumpDrainOn();
+        Serial.println(F("#TEST,DRAIN_START"));
+      }
+    }
+  }
+}
+
+void printTestSummary() {
+  Serial.println(F("RESULT,Param,Val,EMPTY_mean,EMPTY_std,FULL_mean,FULL_std,Delta,SNR,b6_E/b6_F"));
+  for (int p = 0; p < 3; p++) {
+    int n = (p == 0) ? CR_N : (p == 1) ? REP_N : CO_N;
+    for (int v = 0; v < n; v++) {
+      int ei = findResult(0, p, v);
+      int fi = findResult(1, p, v);
+      if (ei < 0 || fi < 0) continue;
+      double delta = results[fi].mean - results[ei].mean;
+      double snr = (results[ei].stddev + results[fi].stddev) > 0 ? fabs(delta) / (results[ei].stddev + results[fi].stddev) : 0;
+      Serial.print(F("RESULT,"));
+      Serial.print(paramNames[p]); Serial.print(F(",0x"));
+      Serial.print(getParamVal(p, v), HEX); Serial.print(',');
+      Serial.print(results[ei].mean, 4); Serial.print(',');
+      Serial.print(results[ei].stddev, 4);  Serial.print(',');
+      Serial.print(results[fi].mean, 4); Serial.print(',');
+      Serial.print(results[fi].stddev, 4);  Serial.print(',');
+      Serial.print(delta, 4);  Serial.print(',');
+      Serial.print(snr, 3);    Serial.print(',');
+      Serial.print(F("0x")); Serial.print(results[ei].b6, HEX); Serial.print('/');
+      Serial.println(results[fi].b6, HEX);
+    }
+  }
+  Serial.println(F("#TEST_SUMMARY_END"));
+}
+
+void runTest() {
+  switch (testState) {
+    case TEST_ENSURE_EMPTY:
+      // 条件独立顺序检查，保证每种情况都有对应动作
+      if (!waterEmptyStable()) {
+        // 未达到空管条件，持续排水
+        pumpDrainOn();
+      }
+      // 必须 IO6+IO7 都高（水位低于低水位）才算空管，开始采集
+      if (waterEmptyStable()) {
+        // 电极露出，停泵等稳定
+        pumpDrainOff();
+        testStage = 0; testParam = 0; testValIdx = 0; testSampleIdx = 0;
+        testState = TEST_STABILIZE;
+        testStabilizeStartMs = millis();
+        Serial.println(F("#TEST,EMPTY_STAGE_START"));
+      }
+      if (millis() - testPhaseStartMs > DRAIN_TIMEOUT_MS) {
+        pumpDrainOff();
+        Serial.println(F("#TEST,ERR,EMPTY_TIMEOUT")); testStop();
+      }
+      break;
+    case TEST_STABILIZE:
+      if (millis() - testStabilizeStartMs >= 2000) {
+        testState = TEST_COLLECT;
+      }
+      break;
+    case TEST_COLLECT:
+      testCollectSample();
+      delay(SAMPLE_GAP_MS);
+      break;
+    case TEST_FILL:
+      // 未到高水位时，确保进水泵开着
+      if (!waterFullStable() && millis() - testPhaseStartMs <= FILL_TIMEOUT_MS) {
+        pumpIntakeOn();
+      }
+      // 水满（IO6+IO7 都为 LOW）时停泵等稳定
+      if (waterFullStable()) {
+        pumpIntakeOff();
+        testStage = 1; testParam = 0; testValIdx = 0; testSampleIdx = 0;
+        testState = TEST_STABILIZE;
+        testStabilizeStartMs = millis();
+        Serial.println(F("#TEST,FULL_STAGE_START"));
+      } else if (millis() - testPhaseStartMs > FILL_TIMEOUT_MS) {
+        pumpIntakeOff();
+        Serial.println(F("#TEST,ERR,FILL_TIMEOUT")); testStop();
+      }
+      break;
+    case TEST_DRAIN_RESTORE:
+      // 未干态时，持续排水
+      if (!waterEmptyStable() && !waterEmptyByHighSensor()) {
+        pumpDrainOn();
+      }
+      if (waterEmptyStable() || waterEmptyByHighSensor()) {
+        pumpDrainOff();
+        testState = TEST_DONE;
+        Serial.println(F("#TEST,DONE"));
+        printTestSummary();
+        testActive = false;
+        apply_params(COS_CH1_DEFAULT, CFB_DEFAULT, REP_DEFAULT);
+      } else if (millis() - testPhaseStartMs > DRAIN_TIMEOUT_MS) {
+        pumpDrainOff();
+        Serial.println(F("#TEST,ERR,RESTORE_TIMEOUT")); testStop();
+      }
+      break;
+    case TEST_DONE:
+    case TEST_IDLE:
+      testActive = false;
+      break;
+  }
+}
+
+// --- 正常监控模式 --------------------------------------------
+bool silentMode = false;    // true=仅打印事件，不打印每轮 [CH1] 轮询
+double baseline_ch1 = 0.0;
+uint32_t good_ch1 = 0;
+uint32_t total_iter = 0;
+const double WET_DELTA_THRESHOLD = 1.0;
+const double STABLE_MAX_DELTA   = 0.15;
+int     stable_count_ch1 = 0;
+bool    wet_alert_shown = false;
+
+void startup_calibration() {
+  Serial.println(F("--- Startup calibration (dry sensors) ---"));
+  double sum = 0; int ok = 0;
+  for (int i = 0; i < 10 && ok < 5; i++) {
+    uint16_t c_raw; uint8_t b6; double c_pf;
+    if (measure_with_params(COS_CH1_DEFAULT, CFB_DEFAULT, REP_DEFAULT, c_raw, b6, c_pf)) {
+      sum += c_pf; ok++;
+      Serial.print(F("[Cal] CH1: ")); Serial.print(c_pf, 4); Serial.println(F("pF"));
+    } else {
+      Serial.print(F("[Cal] CH1: -- raw=")); Serial.println(c_raw);
+    }
+    delay(1000);
+  }
+  if (ok > 0) baseline_ch1 = sum / ok;
+  Serial.print(F("Baseline CH1=")); Serial.print(baseline_ch1, 4); Serial.println(F("pF"));
+  stable_count_ch1 = ok;
+}
+
+void normalMonitor() {
+  uint32_t ts = millis();
+  uint16_t c_raw; uint8_t b6; double c_pf;
+  bool ok = measure_with_params(COS_CH1_DEFAULT, CFB_DEFAULT, REP_DEFAULT, c_raw, b6, c_pf);
+  double delta = ok ? (c_pf - baseline_ch1) : 999.0;
+  bool is_wet = ok && (delta > WET_DELTA_THRESHOLD);
+  if (is_wet && !wet_alert_shown) {
+    Serial.print(F("*** WET DETECTED *** dC=")); Serial.print(delta, 4); Serial.println(F("pF"));
+    wet_alert_shown = true;
+  } else if (!is_wet && wet_alert_shown) {
+    Serial.println(F("*** DRY RESTORED ***"));
+    wet_alert_shown = false;
+  }
+  if (!silentMode) {
+    Serial.print(F("[CH1] raw=")); Serial.print(c_raw);
+    Serial.print(F(" C=")); Serial.print(c_pf, 4); Serial.print(F("pF"));
+    if (ok && baseline_ch1 > 0) {
+      Serial.print(F(" dC=")); Serial.print(delta >= 0 ? "+" : ""); Serial.print(delta, 4); Serial.println(F("pF"));
+    } else Serial.println(F(" [BAD]"));
+  }
+  if (ok) {
+    if (delta > -STABLE_MAX_DELTA && delta < STABLE_MAX_DELTA) {
+      stable_count_ch1++;
+      if (stable_count_ch1 >= 10) { baseline_ch1 = baseline_ch1 * 0.95 + c_pf * 0.05; stable_count_ch1 = 10; }
+    } else stable_count_ch1 = 0;
+    good_ch1++;
+  }
+  total_iter++;
+  if (!silentMode && total_iter % 30 == 0) {
+    Serial.print(F("--- stats: CH1 ")); Serial.print(good_ch1);
+    Serial.print(F("/")); Serial.print(total_iter);
+    Serial.print(F(" baseline=")); Serial.print(baseline_ch1, 4); Serial.println(F("pF ---"));
+  }
+  uint32_t elapsed = millis() - ts;
+  // 延迟移到 loop() 级别，让 waterDebounce() 能以 10ms 间隔持续检测
+}
+
+// --- 命令 ----------------------------------------------------
+void handleSerial() {
+  if (Serial.available() == 0) return;
+  char cmd = Serial.read();
+  if (cmd == '6') { if (!testActive) testStart(); }
+  else if (cmd == '0') { if (testActive) testStop(); }
+  else if (cmd == 'A') pumpIntakeOn();
+  else if (cmd == 'B') pumpIntakeOff();
+  else if (cmd == 'C') pumpDrainOn();
+  else if (cmd == 'D') pumpDrainOff();
+  else if (cmd == 'E') pumpAllOff();
+  else if (cmd == 'S') {
+    silentMode = !silentMode;
+    Serial.print(F("[MODE] silent=")); Serial.println(silentMode ? F("ON (events only)") : F("OFF (full poll)"));
+  }
+  else if (cmd == '5') {
+    delay(50);
+    if (Serial.available()) {
+      char p = Serial.read(); int np = p - '0';
+      if (np >= 0 && np <= 9) positionId = np;
+    }
+  }
+}
+
+// --- 初始化 --------------------------------------------------
+void setup() {
+  pinMode(PUMP_INTAKE_PIN, OUTPUT); digitalWrite(PUMP_INTAKE_PIN, LOW);
+  pinMode(PUMP_DRAIN_PIN,  OUTPUT); digitalWrite(PUMP_DRAIN_PIN,  LOW);
+  pinMode(WATER_HIGH_PIN,  INPUT);
+  pinMode(WATER_LOW_PIN,   INPUT);
+
+  Serial.begin(115200);
+  delay(300);
+  Serial.println(F("\n=== MDC04 v31 - CH1 Monitor + OFAT Test ==="));
+  Serial.println(F("Pins: DQ=2  PumpIn=4  PumpDrain=5  WHigh=6  WLow=7"));
+  Serial.println(F("Normal: CH1 1s poll | Test: send '6' to start OFAT sweep"));
+  gpio_init();
+  delay(2000);
+  startup_calibration();
+  Serial.println(F("--- Start polling (send 6 for test) ---\n"));
+}
+
+void loop() {
+  // 水位检测：非阻塞，loop 每次都进来（约 Hz 级）
+  waterDebounce();
+
+  if (testActive) {
+    runTest();
+  } else {
+    // 测量：约 1Hz，非阻塞
+    static uint32_t lastMonitorMs = 0;
+    if (millis() - lastMonitorMs >= 1000) {
+      lastMonitorMs += 1000;
+      normalMonitor();
+    }
+  }
+
+  handleSerial();
+  yield();
+}

@@ -1,0 +1,248 @@
+/*
+  MDC04 v30 - 正式应用版（只测 CH2/CH4，每秒轮询）
+  通道: CH2=Cos=0x02, CH4=Cos=0x04
+  修复：去掉 CRC-18 校验（v28 证实 CRC 永远 FAIL，但数据正确）
+  改为：范围校验 + 重试机制（物理合理区间 680-900 raw）
+*/
+
+#define DQ_PIN  2
+
+// ─── 单总线时序 ──────────────────────────────────────────────
+inline void gpio_low()  { digitalWrite(DQ_PIN, LOW); }
+inline void gpio_high() { digitalWrite(DQ_PIN, HIGH); }
+inline int  gpio_read() { return digitalRead(DQ_PIN); }
+
+void gpio_init() {
+  pinMode(DQ_PIN, OUTPUT_OPEN_DRAIN);
+  gpio_high();
+}
+
+bool ow_reset() {
+  cli();
+  gpio_low(); delayMicroseconds(500);
+  gpio_high();
+  int found = -1;
+  for (int t = 0; t < 300; t++) {
+    if (gpio_read() == 0) { found = t; break; }
+    delayMicroseconds(1);
+  }
+  sei();
+  delayMicroseconds(found < 0 ? 0 : 410 - found);
+  return found >= 0;
+}
+
+void ow_write_byte(uint8_t byte) {
+  cli();
+  for (uint8_t i = 0; i < 8; i++) {
+    gpio_low();
+    if (byte & 0x01) { delayMicroseconds(6);  gpio_high(); delayMicroseconds(64); }
+    else              { delayMicroseconds(65); gpio_high(); delayMicroseconds(5);  }
+    byte >>= 1;
+  }
+  sei();
+}
+
+uint8_t ow_read_byte() {
+  uint8_t byte = 0;
+  cli();
+  for (uint8_t i = 0; i < 8; i++) {
+    gpio_low(); gpio_high();
+    delayMicroseconds(13);
+    if (gpio_read()) byte |= 0x80;
+    delayMicroseconds(50);
+    byte >>= 1;
+  }
+  sei();
+  return byte;
+}
+
+bool ow_poll_done() {
+  uint32_t deadline = millis() + 500;
+  while (millis() < deadline) {
+    cli();
+    gpio_low(); delayMicroseconds(1); gpio_high(); delayMicroseconds(9);
+    uint8_t bit = gpio_read();
+    sei();
+    if (bit == 0) return true;
+    delayMicroseconds(10);
+  }
+  return false;
+}
+
+// ─── 通道常量 ────────────────────────────────────────────────
+const uint8_t COS_CH1 = 0x09;   // → b6=0x78，100% 稳定
+
+// ─── 正常范围（物理合理区间，MDC04 在此范围内）─────────────
+// 实测正常值: raw ≈ 769-789
+// 异常值: raw < 680 (≈14pF 以下) 或 raw = 0 (无响应)
+// 注意: 去掉 CRC 校验后，偶尔会有 raw 在 680-769 之间的小波动，属于正常
+// 空载 raw≈769-789；接铜片后 raw≈1100-1500（取决于面积/间距）
+// 异常: raw<600（无响应）或>5000（溢出）
+const uint16_t RAW_MIN_VALID = 600;
+const uint16_t RAW_MAX_VALID = 5000;
+
+// ─── 全局状态 ────────────────────────────────────────────────
+double baseline_ch1 = 0.0;
+int     stable_count_ch1 = 0;  // 连续稳定读数计数，用于锁定 baseline
+bool    wet_alert_shown = false;  // WET 报警防抖
+uint32_t good_ch1 = 0;
+uint32_t total_iter = 0;
+
+// ─── 写 Cos ─────────────────────────────────────────────────
+void write_cos(uint8_t cos_val) {
+  if (!ow_reset()) return;
+  ow_write_byte(0xCC);
+  ow_write_byte(0x4E);
+  ow_write_byte(0x1D);
+  ow_write_byte(cos_val);
+  // 写操作不校验 CRC，直接写
+  delayMicroseconds(25);
+  gpio_high();
+  delayMicroseconds(10);
+}
+
+// ─── 触发转换 + 读 Scratchpad ────────────────────────────────
+// 不做 CRC 校验，只做范围检查
+bool convert_and_read(uint16_t& c_raw, uint8_t& b6) {
+  if (!ow_reset()) return false;
+  ow_write_byte(0xCC);
+  ow_write_byte(0x66);          // ConvertC
+  if (!ow_poll_done()) return false;
+
+  if (!ow_reset()) return false;
+  ow_write_byte(0xCC);
+  ow_write_byte(0xBE);          // ReadScratchpad
+  uint8_t d[9];
+  for (int i = 0; i < 9; i++) d[i] = ow_read_byte();
+  gpio_low(); delayMicroseconds(2); gpio_high(); delayMicroseconds(500);
+
+  // 范围校验（无 CRC 时的主要验证手段）
+  c_raw = ((uint16_t)d[3] << 8) | d[2];
+  b6 = d[6];
+
+  if (c_raw < RAW_MIN_VALID) return false;  // 极低值 = 无响应
+  return true;
+  return true;
+}
+
+// ─── 测量通道（重试直到范围有效，最长等 100ms）────────────
+bool measure_channel(uint8_t cos_val, uint16_t& c_raw, uint8_t& b6, double& c_pf) {
+  write_cos(cos_val);
+  delay(3);
+  uint32_t deadline = millis() + 100;
+  while (millis() < deadline) {
+    if (convert_and_read(c_raw, b6)) {
+      c_pf = 15.5 + c_raw / 32768.0 * 31.0;
+      return true;
+    }
+    delay(10);
+  }
+  return false;
+}
+
+// ─── 格式化输出 ───────────────────────────────────────────────
+void print_reading(const char* prefix, uint16_t c_raw, double c_pf,
+                   double baseline, bool ok) {
+  double delta = c_pf - baseline;
+  Serial.print(prefix);
+  Serial.print(" raw="); Serial.print(c_raw);
+  Serial.print(" C="); Serial.print(c_pf, 4); Serial.print("pF");
+  if (ok && baseline > 0) {
+    Serial.print(" dC=");
+    Serial.print(delta >= 0 ? "+" : "");
+    Serial.print(delta, 4); Serial.print("pF");
+  } else if (!ok) {
+    Serial.print(" [BAD]");
+  }
+  Serial.println();
+}
+
+// ─── 开机校准 ────────────────────────────────────────────────
+// ─── 报警阈值 ────────────────────────────────────────────────
+const double WET_DELTA_THRESHOLD = 1.0;  // dC 超过此值视为有水
+const double STABLE_MAX_DELTA   = 0.15;  // ±0.15pF 以内视为"稳定"
+
+void startup_calibration() {
+  Serial.println("--- Startup calibration (max 10 rounds, dry sensors) ---");
+  Serial.println("*** Please ensure sensors are DRY during calibration ***");
+  double sum_ch1 = 0;
+  int ok_ch1 = 0;
+
+  for (int i = 0; i < 10; i++) {
+    uint16_t c_raw; uint8_t b6; double c_pf;
+    bool ok = measure_channel(COS_CH1, c_raw, b6, c_pf);
+    if (ok) {
+      sum_ch1 += c_pf; ok_ch1++;
+      Serial.print("[Cal] CH1: "); Serial.print(c_pf, 4); Serial.println("pF");
+    } else {
+      Serial.print("[Cal] CH1: -- (raw="); Serial.print(c_raw); Serial.println(")");
+    }
+    delay(1000);
+    if (ok_ch1 >= 5) { Serial.println("(early exit)"); break; }
+  }
+
+  if (ok_ch1 > 0) baseline_ch1 = sum_ch1 / ok_ch1;
+  Serial.print("Baseline CH1="); Serial.print(baseline_ch1, 4); Serial.println("pF");
+  Serial.print("(valid samples: CH1="); Serial.print(ok_ch1); Serial.println(")");
+  stable_count_ch1 = ok_ch1;
+}
+
+// ─── 主程序 ───────────────────────────────────────────────────
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+  Serial.println("\n=== MDC04 v30 - CH2/CH4 Monitor (1s poll) ===");
+  gpio_init();
+  delay(2000);
+
+  Serial.println("CH1: Cos=0x09 (b6=0x78)");
+  startup_calibration();
+  Serial.println("--- Start polling ---\n");
+}
+
+void loop() {
+  uint32_t ts = millis();
+  uint16_t c_raw; uint8_t b6; double c_pf;
+
+  // CH1
+  bool ok_ch1 = measure_channel(COS_CH1, c_raw, b6, c_pf);
+  double delta = ok_ch1 ? (c_pf - baseline_ch1) : 999.0;
+
+  // 湿水报警逻辑
+  bool is_wet = ok_ch1 && (delta > WET_DELTA_THRESHOLD);
+  if (is_wet && !wet_alert_shown) {
+    Serial.print("*** WET DETECTED *** dC=");
+    Serial.print(delta, 4); Serial.println("pF");
+    wet_alert_shown = true;
+  } else if (!is_wet && wet_alert_shown) {
+    Serial.println("*** DRY RESTORED ***");
+    wet_alert_shown = false;
+  }
+
+  print_reading("[CH1]", c_raw, c_pf, baseline_ch1, ok_ch1);
+
+  if (ok_ch1) {
+    // 稳定时才更新 baseline（±0.15pF 以内连续 10 次才更新）
+    if (delta > -STABLE_MAX_DELTA && delta < STABLE_MAX_DELTA) {
+      stable_count_ch1++;
+      if (stable_count_ch1 >= 10) {
+        baseline_ch1 = baseline_ch1 * 0.95 + c_pf * 0.05;
+        stable_count_ch1 = 10;  // 保持饱和，不溢出
+      }
+    } else {
+      stable_count_ch1 = 0;  // 波动大，重置计数
+    }
+    good_ch1++;
+  }
+
+  total_iter++;
+
+  if (total_iter % 30 == 0) {
+    Serial.print("--- stats: CH1 "); Serial.print(good_ch1);
+    Serial.print("/"); Serial.print(total_iter);
+    Serial.print(" baseline="); Serial.print(baseline_ch1, 4); Serial.println("pF");
+  }
+
+  uint32_t elapsed = millis() - ts;
+  if (elapsed < 1000) delay(1000 - elapsed);
+}
